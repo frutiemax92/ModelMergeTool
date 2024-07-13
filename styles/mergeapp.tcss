@@ -1,0 +1,19 @@
+ModelEntry {
+    layout: horizontal;
+    height: 4;
+    margin: 1;
+}
+
+#listmodels {
+    width: 64;
+}
+
+#ratio_input {
+    width: 16;
+    content-align: center middle;
+}
+
+BottomButtons {
+    layout: horizontal;
+    height: 4;
+}
