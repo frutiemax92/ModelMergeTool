@@ -2,6 +2,7 @@ from textual.app import App, ComposeResult
 from textual.containers import ScrollableContainer
 from textual.widgets import Header, Footer, Static, ListView, Label, ListItem, Input, Button
 from textual import events, on
+from textual.screen import Screen
 from textual.message import Message
 
 from pathlib import Path
@@ -11,6 +12,17 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import torch
+
+class ErrorScreen(Screen):
+    BINDINGS = [("escape", "app.pop_screen", "Pop screen")]
+
+    def __init__(self, error_message):
+        self.error_message = error_message
+        super().__init__()
+    
+    def compose(self) -> ComposeResult:
+        yield Static(self.error_message)
+        yield Static("Press ESC to continue [blink]_[/]", id="any-key")
 
 class ModelEntry(Static):
     def __init__(self, models : list[str]):
@@ -84,6 +96,91 @@ class MergeApp(App):
         elif message.button == 'merge_button':
             self.merge_models()
     
+    def convert_onetrainer_model_to_diffusers(self, state_dict : dict[str, torch.Tensor]):
+        new_state_dict = {}
+
+        # convert the layers outside the transformer
+        new_state_dict['proj_out.bias'] = state_dict.pop('final_layer.linear.bias')
+        new_state_dict['proj_out.weight'] = state_dict.pop('final_layer.linear.weight')
+        new_state_dict['scale_shift_table'] = state_dict.pop('final_layer.scale_shift_table')
+        new_state_dict['pos_embed.proj.weight'] = state_dict.pop('pos_embed')
+
+        new_state_dict['adaln_single.linear.bias'] = state_dict.pop('t_block.1.bias')
+        new_state_dict['adaln_single.linear.weight'] = state_dict.pop('t_block.1.weight')
+
+        new_state_dict['adaln_single.emb.timestep_embedder.linear_1.bias'] = state_dict.pop('t_embedder.mlp.0.bias')
+        new_state_dict['adaln_single.emb.timestep_embedder.linear_1.weight'] = state_dict.pop('t_embedder.mlp.0.weight')
+        new_state_dict['adaln_single.emb.timestep_embedder.linear_2.bias'] = state_dict.pop('t_embedder.mlp.2.bias')
+        new_state_dict['adaln_single.emb.timestep_embedder.linear_2.weight'] = state_dict.pop('t_embedder.mlp.2.weight')
+
+        new_state_dict['pos_embed.proj.bias'] = state_dict.pop('x_embedder.proj.bias')
+        new_state_dict['pos_embed.proj.weight'] = state_dict.pop('x_embedder.proj.weight')
+
+        new_state_dict['caption_projection.linear_1.bias'] = state_dict.pop('y_embedder.y_proj.fc1.bias')
+        new_state_dict['caption_projection.linear_1.weight'] = state_dict.pop('y_embedder.y_proj.fc1.weight')
+        new_state_dict['caption_projection.linear_2.bias'] = state_dict.pop('y_embedder.y_proj.fc2.bias')
+        new_state_dict['caption_projection.linear_2.weight'] = state_dict.pop('y_embedder.y_proj.fc2.weight')
+
+        # detect the transformer depth
+        depth = 1
+        for key in state_dict.keys():
+            if 'blocks.' in key:
+                current_depth = int(key.split('.')[1])
+                if current_depth > depth - 1:
+                    depth = depth + 1
+        
+        for d in range(depth):
+            attn_q, attn_k, attn_v = torch.chunk(state_dict.pop(f'blocks.{d}.attn.qkv.bias'), 3)
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_q.bias'] = attn_q
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_k.bias'] = attn_k
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_v.bias'] = attn_v
+
+            attn_q, attn_k, attn_v = torch.chunk(state_dict.pop(f'blocks.{d}.attn.qkv.weight'), 3)
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_q.weight'] = attn_q
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_k.weight'] = attn_k
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_v.weight'] = attn_v
+
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_out.0.bias'] = \
+                state_dict.pop(f'blocks.{d}.attn.proj.bias')
+            new_state_dict[f'transformer_blocks.{d}.attn1.to_out.0.weight'] = \
+                state_dict.pop(f'blocks.{d}.attn.proj.weight')
+
+            cross_attn_k, cross_attn_v = torch.chunk(state_dict.pop(f'blocks.{d}.cross_attn.kv_linear.bias'), 2)
+            cross_attn_q = state_dict.pop(f'blocks.{d}.cross_attn.q_linear.bias')
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_k.bias'] = cross_attn_k
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_q.bias'] = cross_attn_q
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_v.bias'] = cross_attn_v
+
+            cross_attn_k, cross_attn_v = torch.chunk(state_dict.pop(f'blocks.{d}.cross_attn.kv_linear.weight'), 2)
+            cross_attn_q = state_dict.pop(f'blocks.{d}.cross_attn.q_linear.weight')
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_k.weight'] = cross_attn_k
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_q.weight'] = cross_attn_q
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_v.weight'] = cross_attn_v
+
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_out.0.bias'] = \
+                state_dict.pop(f'blocks.{d}.cross_attn.proj.bias')
+            new_state_dict[f'transformer_blocks.{d}.attn2.to_out.0.weight'] = \
+                state_dict.pop(f'blocks.{d}.cross_attn.proj.weight')
+            
+            new_state_dict[f'transformer_blocks.{d}.ff.net.0.proj.bias'] = \
+                state_dict.pop(f'blocks.{d}.mlp.fc1.bias')
+            new_state_dict[f'transformer_blocks.{d}.ff.net.0.proj.weight'] = \
+                state_dict.pop(f'blocks.{d}.mlp.fc1.weight')
+            new_state_dict[f'transformer_blocks.{d}.ff.net.2.bias'] = \
+                state_dict.pop(f'blocks.{d}.mlp.fc2.bias')
+            new_state_dict[f'transformer_blocks.{d}.ff.net.2.weight'] = \
+                state_dict.pop(f'blocks.{d}.mlp.fc2.weight')
+            
+            new_state_dict[f'transformer_blocks.{d}.scale_shift_table'] = \
+                state_dict.pop(f'blocks.{d}.scale_shift_table')
+        return new_state_dict
+    
+    def is_onetrainer_model(self, state_dict):
+        for key in state_dict.keys():
+            if 'final_layer' in key:
+                return True
+        return False
+    
     def merge_models(self):
         # get the ratios
         ratios = []
@@ -112,6 +209,11 @@ class MergeApp(App):
             for key in f.keys():
                 state_dict[key] = f.get_tensor(key) * ratios[0]
             
+            # onetrainer compatibility
+            if self.is_onetrainer_model(state_dict):
+                state_dict = self.convert_onetrainer_model_to_diffusers(state_dict)
+        
+        error = ''
         # repeat this with all the other models
         for i in range(1, len(self.model_entries)):
             model_entry = self.model_entries[i]
@@ -121,11 +223,22 @@ class MergeApp(App):
             model_path = models_path.joinpath(model_filename)
 
             with safe_open(model_path, framework='pt', device='cpu') as f:
+                new_state_dict = {}
                 for key in f.keys():
-                    try:
-                        state_dict[key] = state_dict[key] + f.get_tensor(key) * ratios[i]
-                    except:
-                        continue
+                    new_state_dict[key] = f.get_tensor(key)
+                
+            # onetrainer compatibility
+            if self.is_onetrainer_model(new_state_dict):
+                new_state_dict = self.convert_onetrainer_model_to_diffusers(new_state_dict)
+
+            for key in state_dict.keys():
+                try:
+                    state_dict[key] = state_dict[key] + new_state_dict[key] * ratios[i]
+                except Exception as e:
+                    error = error + str(e) + '\n'
+        
+        if error != '':
+            self.push_screen(ErrorScreen(error))
         
         # save the model
         save_file(state_dict, 'out.safetensors')
